@@ -1,0 +1,83 @@
+<context>
+    I'm a 26-year-old software developer. I've taken an indefinite break from work to strengthen/explore myself, expand my interdisciplinary knowledge graph, and venture into solo projects. My design/architectonic ethos is to be lean, rapid, and iterative, so that I can touch and explore the widest possible set of solution spaces for whatever we are pursuing. We gotta be nimble and think outside the box to eliminate the ordinary clutter/overhead as much as possible, while crafting solid and reliable artifacts. We achieve this nimbleness by leveraging high-impact architectural/systemic decisions/primitives before hitting diminishing returns, not by taking superficial trade-offs that degrade the clarity or solidity of our solutions.
+
+    <project>
+        A proprietary funding-rate and basis anomaly scanner for Crypto Perp-Perp arbitrage. Complements—but remains strictly decoupled from—the execution engine. Surfaces localized, pair-specific anomalies across the same 14 Asian venues the engine routes to, normalizes them into comparable units, and ranks them by deployment viability. Doubles as a longitudinal research substrate: every observation is persisted to build proprietary datasets (anomaly half-life, cross-exchange lead-lag, basis behavior during spikes, post-payout mean-reversion) that no public scanner exposes. [we can edit or remove CEXs in the future. The initial 14 are: ["BINANCE",  "BINGX",  "BITGET",  "BITMART",  "BLOFIN",  "BYBIT",  "COINEX",  "GATE.IO",  "HTX",  "KUCOIN",  "MEXC",  "OKX",  "PHEMEX",  "XT.COM"]]
+
+        <positioning_rationale>
+            Public scanners (Coinglass, Zeek, Velo) are optimized for a broad retail audience and display raw per-epoch rates across heterogeneous funding intervals, which is actively misleading for viability math. This scanner encodes the operator's specific gates natively: venue-parity with the engine's routing set, epoch-normalized yield as a first-class unit, and automated Breakeven Epochs ranking. The long-term compounding asset is the historical dataset itself, not the live scanner view.
+        </positioning_rationale>
+
+        <architectural_primitives>
+            <persistence_substrate>DuckDB embedded over partitioned Parquet files. Zero-daemon, columnar, analytical-SQL native, portable artifacts. Rejects Postgres (ops overhead, weak on window-heavy columnar scans), InfluxDB (schema rigidity during research phase), and SQLite (row-store, poor for analytical scans over millions of rows). Parquet partitioning: `year=/month=/day=/`, append-only.</persistence_substrate>
+
+            <canonical_schema enforcement="normalized at collector boundary">
+                Every observation conforms to a single locked row shape; exchange-specific idiosyncrasies never leak downstream.
+                Fields: `ts_utc` (ms), `exchange` (canonical slug), `symbol_canonical` (CCXT unified, e.g., `BTC/USDT:USDT`), `funding_rate` (raw per-epoch), `funding_interval_h` (1 | 4 | 8), `predicted_rate`, `next_funding_ts`, `mark_price`, `index_price`, `open_interest_usd`, `volume_24h_usd`, `apy_norm` ($r \cdot 8760 / T_{epoch}$, computed and stored).
+            </canonical_schema>
+
+            <ingestion_topology>Batched REST polling via CCXT `fetch_funding_rates()` (no-symbol batch call) on a 30–60s cadence per venue. One async task per exchange. WebSockets explicitly rejected: the scanner's physics is wide-and-shallow across hundreds of symbols, inverse of the engine's deep-and-narrow single-pair streams. Aggregate request budget remains trivially under every venue's rate limit.</ingestion_topology>
+
+            <process_boundary>Scanner collector and engine run as fully separate OS processes on the VPS with independent lifecycles and failure domains. No shared runtime state. Any engine-side read of scanner data occurs strictly via DuckDB query against the Parquet tree—never via in-memory coupling. Guarantees that scanner analytics pressure can never stall the engine's event loop.</process_boundary>
+
+            <host_topology>
+            Two-host split. The collector runs on the Singapore VPS as the sole writer to the canonical Parquet tree; the dashboard runs on the operator laptop as the sole reader. The laptop's Parquet tree is a read-only mirror hydrated from the VPS via `rsync` over the existing SSH channel, exploiting Parquet partitions' append-only physics (`--append-verify` skips rehashing untouched files; only new partitions transfer). Replication is operator-triggered, not continuous: accepts a bounded staleness window on history in exchange for zero exposed network surface and resilience to VPS network blips. No HTTP/API layer between hosts.
+            </host_topology>
+        </architectural_primitives>
+
+        <components>
+            <collectors type="Async REST Pollers">One task per exchange. Pulls batch funding snapshots, applies canonical normalization (symbol unification, interval detection, USD conversion, $APY_{norm}$ computation), appends to the active Parquet partition. Failure of any single venue is isolated and logged; other collectors continue uninterrupted.</collectors>
+
+            <analytics_layer form="Parameterized SQL views over DuckDB">
+                <anomaly_candidates>Symbols where $|APY_{norm}| \geq \theta$ AND $volume_{24h} \geq V_{min}$ AND the anomaly has persisted across $\geq N$ consecutive observations. Persistence filter rejects single-tick spikes (data errors or already-decayed transients).</anomaly_candidates>
+                <cross_exchange_delta>For every symbol listed on $\geq 2$ venues, computes $\Delta r = r_{max} - r_{min}$ and ranks. Directly maps to candidate leg-pairs for the engine.</cross_exchange_delta>
+                <breakeven_epochs_ranking>Computes $E_{BE} = (C_{basis} + C_{fees}) / Y_{epoch}$ in SQL. Taker-fee constants and basis-cost estimates are configurable per venue-pair. Candidates sort by $E_{BE}$ ascending.</breakeven_epochs_ranking>
+            </analytics_layer>
+
+            <dashboard stack="Streamlit + Plotly" role="Live Radar/Scanner">Single-operator, localhost-bound, runs on the operator laptop. Consumes two decoupled data sources: a direct-from-CCXT live snapshot for current cross-exchange spreads (laptop-issued REST fan-out, ephemeral, no persistence), and the local Parquet mirror via DuckDB for per-symbol history. Never runs collectors. Graduation rule: patterns earn a place on the dashboard only after proving themselves in the research layer.</dashboard>
+
+            <alerts transport="Pushover">Threshold-breach hook reusing the engine's existing Pushover credentials. Mobile surface is Pushover only; no native mobile app.</alerts>
+
+            <research_layer tooling="Jupyter/Marimo notebooks">Exploratory lab bench over the same DuckDB substrate. Hosts the proprietary pattern studies: anomaly half-life distributions, cross-exchange funding lead-lag, basis behavior during anomalies, post-payout mean-reversion. Free use of sklearn/statsmodels/scipy at this layer; nothing ships to the live radar without being expressible as clear SQL logic.</research_layer>
+            <diagram_of_proposed_architecture>
+                
+                ┌─────────────────────────────────────────────────┐
+                │  Collectors (async, one task per exchange)      │
+                │  → normalize → append Parquet partitions        │
+                └─────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+                ┌─────────────────────────────────────────────────┐
+                │  DuckDB (embedded, reads Parquet directly)      │
+                └─────────────────────────────────────────────────┘
+                                        │
+                        ┌──────────────┼──────────────┐
+                        ▼              ▼              ▼
+                ┌──────────┐  ┌────────────┐  ┌───────────┐
+                │ Analytics│  │ Dashboard  │  │ Research  │
+                │  views   │  │ (Plotly)   │  │ notebooks │
+                │          │  │            │  │           │
+                └──────────┘  └────────────┘  └───────────┘
+                        │
+                        ▼
+                ┌──────────┐
+                │  Alerts  │  (Pushover hook, reusing engine's creds)
+                └──────────┘
+            </diagram_of_proposed_architecture>
+        </components>
+
+        <scope_guardrails form="explicit negative space">
+            <no_orderbook_history>Top-of-book snapshots only if needed. Deep L2 persistence is explicitly rejected as a storage and complexity trap.</no_orderbook_history>
+            <no_trade_tape>Tick-level trade ingestion out of scope.</no_trade_tape>
+            <no_live_ml>No model serving against the live radar. Statistical modeling lives in the research layer only.</no_live_ml>
+            <no_auth_layer>Single-operator, localhost-bound, mirroring the engine's deployment posture.</no_auth_layer>
+            <no_charting_platform_drift>The scanner is not a charting app, not a data platform, not a second product. Any feature pulling it in those directions is rejected.</no_charting_platform_drift>
+        </scope_guardrails>
+
+        <deployment_posture>
+            <collector host="Singapore VPS" lifecycle="systemd-managed always-on">Co-resides with the engine on the same VPS as an independent process. Sole writer to the canonical Parquet tree at `/srv/scanner/data/funding/`. Inherits the VPS's geographic latency barycenter across the 14 target venues; latency is not first-order for the polling cadence but the co-location is free.</collector>
+            <dashboard host="Operator laptop" lifecycle="launched on demand">Reads the local Parquet mirror for history; issues its own live CCXT calls for the real-time radar. Never writes to the canonical tree.</dashboard>
+            <mirror transport="rsync over SSH, operator-triggered">Manual sync operator-triggered command invokes `rsync --append-verify <vps>:/srv/scanner/data/funding/ ./data/funding/`. Reuses the SSH channel already established for VS Code Remote-SSH; no additional auth surface.</mirror>
+            </deployment_posture>
+        </project>
+    </context>

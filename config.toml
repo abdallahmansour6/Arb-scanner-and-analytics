@@ -1,0 +1,37 @@
+# Scanner runtime config. Single source of truth; loaded by scanner.config.
+[runtime]
+data_dir = "data/funding"
+poll_interval_s = 45            # per-exchange cadence; CCXT batch call per tick
+log_level = "INFO"
+# Recency window for the analytical layer. Observations older than this
+# are excluded from latest_funding / anomaly_candidates / cross_exchange_delta /
+# breakeven_epochs. Tune empirically against the `freshness_by_exchange`
+# diagnostic — start generous (~3x poll_interval_s in minutes) and tighten
+# once per-venue lag distributions stabilize.
+analytics_max_age_min = 5
+
+[exchanges]
+# Canonical slugs match CCXT ids. Order is presentation-only.
+enabled = [
+    "binance", "bingx", "bitget", "bitmart", "blofin",
+    "bybit", "coinex", "gate", "htx", "kucoin",
+    "mexc", "okx", "phemex", "xt",
+]
+
+[anomaly]
+abs_apy_threshold = 0.50        # |APY_norm| >= 50%
+min_volume_24h_usd = 2_000_000
+persistence_ticks = 3           # consecutive observations required
+
+[breakeven]
+# Per-venue taker fee (decimal). Override per-exchange as needed.
+default_taker_fee = 0.0005
+basis_cost_bps_default = 5      # estimated round-trip basis cost (bps of notional)
+
+[breakeven.taker_fee_overrides]
+# binance = 0.00045
+
+[alerts]
+pushover_user_key_env = "PUSHOVER_USER_KEY"
+pushover_app_token_env = "PUSHOVER_APP_TOKEN"
+breakeven_epochs_alert_max = 3  # alert if E_BE <= this
